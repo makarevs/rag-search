@@ -6,6 +6,7 @@ import re
 import os
 
 import numpy as np
+from scipy import spatial
 import faiss
 from sentence_transformers import SentenceTransformer
 
@@ -16,17 +17,36 @@ nltk.download('punkt')
 
 from nltk.tokenize import sent_tokenize
 
+noisy = True
+cum_percent = 0
+inc_percent = 5
+my_bar = None
 
-@st.cache_data(func=None, hash_funcs=None)
+if noisy:
+    my_bar = st.progress(0, text="Paragraph data preparation")
+
+
+def show_progress(message: str, percent: float = None):
+    global cum_percent, inc_percent, my_bar
+    if noisy:
+        if percent:
+            show_percent = percent
+        else:
+            cum_percent = min(100, cum_percent + inc_percent)
+            show_percent = cum_percent
+        my_bar.progress(show_percent, text=message)
+
+
+# @st.cache_data(func=None, hash_funcs=None)
 def load_data(file: Union[str, Path]) -> pd.DataFrame:
     """
     Load data from a specified CSV file
     """
 
-    st.markdown('Loading data...') 
+    show_progress('Loading data...') 
     data = pd.read_csv(file)
     data = data.applymap(str)  # apply str() to each cell
-    st.markdown('Data loaded') 
+    show_progress('Data loaded') 
 
     # return pd.read_csv(file).applymap(str)
     return data
@@ -41,12 +61,12 @@ def validate_titles(data: pd.DataFrame):
     title_lengths = data["Title"].apply(lambda x: len(x))
 
     longest_title_length = max(title_lengths)
-    st.write(f"Longest title length: {longest_title_length}")
+    # st.write(f"Longest title length: {longest_title_length}")
 
     if any(title_lengths > 200):
         st.error("Some article titles exceed 200 characters.")
-    else:
-        st.success("All article titles are within 200 characters.")
+    # else:
+    #     st.success("All article titles are within 200 characters.")
 
     return data
 
@@ -96,30 +116,21 @@ def split_paragraphs(data: pd.DataFrame, do_validate_newlines: bool = False) -> 
     return data2
 
 
-@st.cache_data(func=None, hash_funcs=None)
+# @st.cache_data(func=None, hash_funcs=None)
 def by_paragraphs(data: pd.DataFrame) -> pd.DataFrame:
 
     # First, create a copy of the DataFrame
     data2 = data.copy()
 
-    noisy = True
-
-    if noisy:
-        my_bar = st.progress(0, text="Paragraph data preparation")
-    if noisy:
-        my_bar.progress(0, text="Exploding paragraphs...")
+    show_progress("Exploding paragraphs...")
     data_by_para = data2.explode("Paragraphs").reset_index(names="paper_no")
-    if noisy:
-        my_bar.progress(25, text="Splitting into number and text...")
+    show_progress("Splitting into number and text...")
     data_by_para[["ParaNo","ParaText"]] = data_by_para.apply(lambda row: [row["Paragraphs"][0], row["Paragraphs"][1]], axis='columns', result_type='expand')
-    if noisy:
-        my_bar.progress(40, text="Dropping unnecessary tuples...")
+    show_progress("Dropping unnecessary tuples...")
     data_by_para.drop("Paragraphs", axis='columns', inplace=True)
-    if noisy:
-        my_bar.progress(80, text="Resetting index...")
+    show_progress("Resetting index...")
     data_by_para.reset_index(drop=False, names="ParagraphIndex", inplace=True)  # Add index as column 'Index'
-    if noisy:
-        my_bar.progress(100, text="Done prepping paragrph data")
+    show_progress("Done prepping paragrph data")
 
     return data_by_para
 
@@ -215,35 +226,31 @@ def create_or_load_embeddings(data, model):
 
     return embeddings
 
-@st.cache_resource(func=None, hash_funcs=None)
+
+# @st.cache_resource(func=None, hash_funcs=None)  # had to comment after added progress
 def prepare_rag(data: pd.DataFrame):
     # Model for generating embeddings
     # https://www.sbert.net/docs/pretrained_models.html
+    model_name = 'all-MiniLM-L6-v2'
     # model = SentenceTransformer('multi-qa-MiniLM-L6-cos-v1')
     # model = SentenceTransformer('paraphrase-MiniLM-L3-v2')
     # model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
 
     if 'model' not in st.session_state:
-        st.session_state['model'] = SentenceTransformer('all-MiniLM-L6-v2')
-    
+        show_progress(f"Loading model '{model_name}'...")
+        st.session_state['model'] = SentenceTransformer(model_name)
+        show_progress(f"Finished loading the model '{model_name}'")
 
     # Flatten the list of documents in your dataframe
-    data_with_paragraphs = by_paragraphs(data)
-
-    # paragraphs = data_with_paragraphs["ParaText"].tolist()
-
+    if 'data_with_paragraphs' not in st.session_state:
+        st.session_state['data_with_paragraphs'] = by_paragraphs(data)
 
     # Generate embeddings for all paragraphs
     if 'embeddings' not in st.session_state:
         st.session_state['embeddings'] = create_or_load_embeddings(
-            data_with_paragraphs, st.session_state['model']
+            st.session_state['data_with_paragraphs'], 
+            st.session_state['model'],
         )
-    # st.write(f"Generating embeddings for all paragraphs...")
-    # embeddings = model.encode(
-    #     data_with_paragraphs["ParaText"].tolist(), 
-    #     convert_to_tensor=True, 
-    #     show_progress_bar=True
-    # )
 
     # Convert embeddings to numpy array for FAISS
     # xb = embeddings.numpy()
@@ -253,16 +260,18 @@ def prepare_rag(data: pd.DataFrame):
     d = xb.shape[1]
 
     # Build the FAISS index  # https://github.com/facebookresearch/faiss/wiki/Getting-started
-    st.write(f"Building the FAISS index...")
-    index = faiss.IndexFlatL2(d)
-    index.add(xb)
+    if 'faiss_index' not in st.session_state:
+        show_progress(f"Building the FAISS index...")
+        st.session_state['faiss_index'] = faiss.IndexFlatL2(d)
+        st.session_state['faiss_index'].add(xb)
+    show_progress("Finished indexing")
 
     return {
         "model": st.session_state['model'],
-        "index": index,
+        "index": st.session_state['faiss_index'],
         # "paragraphs": paragraphs,
         "embeddings": st.session_state['embeddings'],
-        "data_with_paragraphs": data_with_paragraphs,
+        "data_with_paragraphs": st.session_state['data_with_paragraphs'],
     }
 
 
@@ -336,35 +345,86 @@ def ask_question_and_search_old(embed_model, faiss_index, df, paragraphs, questi
     return closest_embeddings, closest_paragraphs
 
 
+def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_data, embeddings, pre_para_num, post_para_num):
+    """Decide which surrounding paragraphs to inludein answer
+    
+    Draft implementation:
+        pre_para_num, post_para_num - fixed number to include before and after, checked for article boundaries
+    Refined inplementation:
+        pre_para_num, post_para_num - max number to include before and after, checked for article boundaries, and truncated by goal function
+    """
+
+    # Get pararaph data for next best index
+    best_data = para_data.loc[best_abs_index]
+    # Get data for the paper where best index was found
+    paper_data = para_data[para_data['paper_no'] == best_data['paper_no']]
+    # Get index bounds for the paper
+    lowest_abs_index = paper_data['ParagraphIndex'].index[0]  # or paper_data['ParagraphIndex'].tolist()[0]
+    highest_abs_index = paper_data['ParagraphIndex'].index[-1]  # or paper_data['ParagraphIndex'].tolist()[-1]
+    selected_abs_indices = range(
+        max(lowest_abs_index, best_abs_index-pre_para_num), 
+        min(highest_abs_index, best_abs_index+post_para_num)+1
+    )
+    expanded_para_data = para_data.loc[selected_abs_indices]
+    expanded_embeddings = embeddings[selected_abs_indices]
+
+    # expanded_indices = [
+    #     i 
+    #     for index in paper_data['ParaNo']
+    #     for i in range(max(0, index-pre_para_num), min(len(data['paragraphs'])-1, index+post_para_num))
+    # ]
+    # expanded_paragraphs = [data['paragraphs'][i] for i in expanded_indices]
+    # expanded_embeddings = [data['embedding'][i] for i in expanded_indices]
+
+    # reference_embedding = np.array([...])
+    # embeddings = np.array([[...], [...], ...])  # array of multiple embeddings
+    question_embedding_1d = question_embedding.squeeze() # or question_embedding.reshape(-1)
+    # print(f"question_embedding.shape={question_embedding_1d.shape}")  # If using plain Python
+    # for e in expanded_embeddings:
+    #     print(f"e.shape={e.shape}")
+
+    expanded_distances = [spatial.distance.cosine(question_embedding_1d, e) for e in expanded_embeddings]
+
+    return expanded_distances, expanded_para_data
+
+
 # def ask_question_and_search(embed_model, faiss_index, data, question):
-def ask_question_and_search(embed_model, faiss_index, para_data, question):
+def ask_question_and_search(embed_model, faiss_index, para_data, embeddings, question):
     # Generate embedding for the question
     question_embedding = embed_model.encode([question])
     
     # Search the FAISS index
     D, I = faiss_index.search(np.ascontiguousarray(question_embedding), k=3)
 
-    # Get the actual paragraph index, title and text
-    closest_paragraphs = para_data.loc[I[0]]
+    just_best = False
 
-    for i, row in closest_paragraphs.iterrows():
-        st.markdown(f":red[Title:] {row['Title']}")
-        st.text(f"Proximity score: {D[0][I[0].tolist().index(row.name)]}")  # ParagraphIndex
-        st.write(f"Paragraph: :blue[{row['ParaText']}]")
+    if just_best:
+        # Get the actual paragraph index, title and text
+        closest_paragraphs = para_data.loc[I[0]]
 
-    if False:
-    # Create a new DataFrame where each row is a paragraph, along with its index and title
-        paragraph_data = pd.DataFrame({
-            'ParagraphIndex': list(range(len(paragraphs))),
-            'ParagraphText': paragraphs,
-            'Title': data_with_paragraphs['Title'],  # assuming data_with_paragraphs has a 'Title' column
-        })
+        for i, row in closest_paragraphs.iterrows():
+            st.markdown(f"### :red[Title:] {row['Title']}")
+            st.text(f"Proximity score: {D[0][I[0].tolist().index(row.name)]}")  # ParagraphIndex
+            st.write(f"Paragraph:\n :blue[{row['ParaText']}]")
+    else:
+        # Get the surrounding paragraphs with metadata about distances and relative indices in paper
+        for best_abs_index in I[0].tolist():
+            st.markdown(f"-----------------------------")
+            st.markdown(f"### :red[Title:] {para_data.loc[best_abs_index]['Title']}")
+            expanded_distances, expanded_para_data = expand_around_relevant_paragraphs(
+                question_embedding=question_embedding, 
+                best_abs_index=best_abs_index,
+                para_data=para_data, 
+                embeddings=embeddings, 
+                pre_para_num=1, 
+                post_para_num=2
+            )
+            # for para_distance, para_data in zip(expanded_distances, expanded_para_data):
+            for i, para_data_row in enumerate(expanded_para_data.itertuples()):
+                para_distance = expanded_distances[i]
+                para_data_row = pd.Series(data=para_data_row[1:], index=expanded_para_data.columns)
+                st.write(f":green[{round(para_distance,3)}] | :grey[{para_data_row['ParaNo']}] | :blue[{para_data_row['ParaText']}]")
 
-        return {
-            "index": index,
-            "paragraph_data": paragraph_data,
-            "embeddings": embeddings,
-        }
 
 def main():
     """
@@ -375,14 +435,14 @@ def main():
     DATA_FILE = "data/medium.csv"
 
     # Load dataset
-    data = load_data(DATA_FILE)
+    if 'papers_data' not in st.session_state:
+        st.session_state['papers_data'] = load_data(DATA_FILE)
 
     # Display data validation and longest title
-    st.markdown("**Data Prep and Validation**")
-    st.markdown("...in progress...")
+    show_progress("**Data Prep and Validation** in progress...")
 
     # validate_titles(data)
-    data_paras_split = split_paragraphs(data, do_validate_newlines = True)
+    data_paras_split = split_paragraphs(st.session_state['papers_data'], do_validate_newlines = True)
 
     # literal_search(data)
 
@@ -395,7 +455,7 @@ def main():
     #     "data_with_paragraphs": data_with_paragraphs,
     # }
 
-    st.markdown("The end of data prep. Ready to answer question on the dataset...")
+    show_progress("The end of data prep. Ready to answer question on the dataset...")
 
     # Unpack the embedding model, faiss index, and dataset from embed_data_dict 
     model = embed_data_dict['model']
@@ -416,6 +476,7 @@ def main():
             embed_model=model, 
             faiss_index=index, 
             para_data=data_with_paragraphs, 
+            embeddings=embeddings,
             question=question,
         )
 
