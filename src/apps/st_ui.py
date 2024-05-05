@@ -12,8 +12,18 @@ from sentence_transformers import SentenceTransformer
 
 # Create a sidebar
 st.sidebar.header('Settings')
-PRE_PARA_NUM = st.sidebar.slider('Number of paragraphs to prepend', min_value=0, max_value=10, value=1, step=1)
-POST_PARA_NUM = st.sidebar.slider('Number of paragraphs to append', min_value=0, max_value=10, value=2, step=1)
+NUM_FRAGS_TO_RETURN = st.sidebar.slider('Number of fragments to return', min_value=0, max_value=10, value=5, step=1)
+PRE_PARA_NUM = st.sidebar.slider('Number of paragraphs to prepend', min_value=0, max_value=10, value=6, step=1)
+POST_PARA_NUM = st.sidebar.slider('Number of paragraphs to append', min_value=0, max_value=10, value=8, step=1)
+# The following defines the multiplier by which the best distance will be multiplied 
+#   before comparing to the next best distance with expansion
+#   If next best is smaller than that product, it will be used with expanded paragraphs
+#   Otherwis only the single best paragraph will be displayed
+MIN_BEST_DISTANCE = st.sidebar.number_input('Minimal distance as basis for epansion', min_value=0.5, max_value=5.0, value=1.0, step=0.5)
+THRESHOLD_TIMES = st.sidebar.number_input('Laxness of switching to expansion', min_value=1.0, max_value=10.0, value=3.0, step=0.5)
+EC_MIN = 0.
+EC_MAX = 2.
+EXPANSION_COEF = st.sidebar.number_input(f'Preference for expansion [{EC_MIN}..{EC_MAX}]', min_value=EC_MIN, max_value=EC_MAX, value=0.2, step=0.01)
 
 MODEL_NAMES = [
     'all-MiniLM-L6-v2', 
@@ -22,6 +32,7 @@ MODEL_NAMES = [
     'paraphrase-multilingual-mpnet-base-v2',
 ]  # Replace these with your actual model names
 MODEL_NAME = st.sidebar.selectbox('Model Name', MODEL_NAMES)
+USED_MODEL_NAME = ""
 SHOW_DISTANCE = st.sidebar.checkbox('Show paragraph distance', value=True)
 SHOW_NUMBER = st.sidebar.checkbox('Show paragraph number', value=True)
 
@@ -249,6 +260,8 @@ def create_or_load_embeddings(data, model):
 
 # @st.cache_resource(func=None, hash_funcs=None)  # had to comment after added progress
 def prepare_rag(data: pd.DataFrame):
+
+    global USED_MODEL_NAME
     # Model for generating embeddings
     # https://www.sbert.net/docs/pretrained_models.html
     model_name = MODEL_NAME  # 'all-MiniLM-L6-v2'
@@ -256,10 +269,11 @@ def prepare_rag(data: pd.DataFrame):
     # model = SentenceTransformer('paraphrase-MiniLM-L3-v2')
     # model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
 
-    if 'model' not in st.session_state:
+    if ('model' not in st.session_state) or (MODEL_NAME != USED_MODEL_NAME):
         show_progress(f"Loading model '{model_name}'...")
         st.session_state['model'] = SentenceTransformer(model_name)
         show_progress(f"Finished loading the model '{model_name}'")
+    USED_MODEL_NAME = MODEL_NAME
 
     # Flatten the list of documents in your dataframe
     if 'data_with_paragraphs' not in st.session_state:
@@ -353,7 +367,7 @@ def ask_question_and_search_old(embed_model, faiss_index, df, paragraphs, questi
     question_embedding = embed_model.encode([question])
     
     # Search the FAISS index
-    D, I = faiss_index.search(np.ascontiguousarray(question_embedding), k=3)
+    D, I = faiss_index.search(np.ascontiguousarray(question_embedding), k=NUM_FRAGS_TO_RETURN)
     
     # Get the actual embedding and text
     closest_embeddings = [df['Embeddings'][i] for i in I[0]]
@@ -394,7 +408,7 @@ def scan_around(best_abs_index, expanded_distances, expanded_para_data) -> Tuple
                 cur_abs_indices = range(lower_abs_bound, upper_abs_bound+1)
                 cur_use_distances = np.array(expanded_distances)[list(cur_rel_indices)]
                 # Calculate the objective function
-                cur_adj_distance = np.average(cur_use_distances)
+                cur_adj_distance = np.average(cur_use_distances) / len(cur_abs_indices)**EXPANSION_COEF
 
                 if len(cur_use_distances) == 1:
                     best_distance = cur_adj_distance
@@ -404,7 +418,7 @@ def scan_around(best_abs_index, expanded_distances, expanded_para_data) -> Tuple
                         min_use_distances = cur_use_distances
                         min_abs_indices = cur_abs_indices
 
-        if min_adj_distance < 2 * best_distance:
+        if min_adj_distance < THRESHOLD_TIMES * max(best_distance, MIN_BEST_DISTANCE):
             use_distances, use_para_data = min_use_distances, expanded_para_data.loc[list(min_abs_indices)]
         else:
             use_distances, use_para_data = [best_distance], expanded_para_data.loc[[best_abs_index]]
@@ -412,7 +426,7 @@ def scan_around(best_abs_index, expanded_distances, expanded_para_data) -> Tuple
     return use_distances, use_para_data 
 
 
-def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_data, embeddings, PRE_PARA_NUM, POST_PARA_NUM):
+def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_data, embeddings, pre_para_num, post_para_num):
     """Decide which surrounding paragraphs to inludein answer
     
     Draft implementation:
@@ -451,7 +465,7 @@ def ask_question_and_search(embed_model, faiss_index, para_data, embeddings, que
     question_embedding = embed_model.encode([question])
     
     # Search the FAISS index
-    D, I = faiss_index.search(np.ascontiguousarray(question_embedding), k=3)
+    D, I = faiss_index.search(np.ascontiguousarray(question_embedding), k=NUM_FRAGS_TO_RETURN)
 
     just_best = False
 
@@ -473,17 +487,19 @@ def ask_question_and_search(embed_model, faiss_index, para_data, embeddings, que
                 best_abs_index=best_abs_index,
                 para_data=para_data, 
                 embeddings=embeddings, 
-                PRE_PARA_NUM=1, 
-                POST_PARA_NUM=2
+                pre_para_num=PRE_PARA_NUM, 
+                post_para_num=POST_PARA_NUM
             )
             # for para_distance, para_data in zip(expanded_distances, expanded_para_data):
             for i, para_data_row in enumerate(expanded_para_data.itertuples()):
                 para_distance = expanded_distances[i]
                 para_data_row = pd.Series(data=para_data_row[1:], index=expanded_para_data.columns)
+                is_best_para = para_data_row['ParagraphIndex'] == best_abs_index
+                color_para = 'red' if is_best_para else 'blue'
                 entry = ' | '.join(
                     ([f":green[{round(para_distance,3)}]"] if SHOW_DISTANCE else []) +
                     ([f":grey[{para_data_row['ParaNo']}]"] if SHOW_NUMBER else []) +
-                    [f":blue[{para_data_row['ParaText']}]"]
+                    [f":{color_para}[{para_data_row['ParaText']}]"]
                 )
                 st.write(entry)
 
