@@ -230,11 +230,11 @@ def create_or_load_embeddings(data, model):
         # Check if the embeddings file exists
         if os.path.isfile(embeddings_file_path):
             # Load embeddings from disk
-            st.write(f"Loading embeddings from disk...")
+            show_progress(f"Loading embeddings from disk...")
             embeddings = np.load(embeddings_file_path)
         else:
             # Generate embeddings and save them to disk
-            st.write(f"Generating embeddings for all paragraphs...")
+            show_progress(f"Generating embeddings for all paragraphs...")
             embeddings = model.encode(
                 data["ParaText"].tolist(), 
                 convert_to_tensor=True, 
@@ -242,6 +242,7 @@ def create_or_load_embeddings(data, model):
             ).numpy()
             np.save(embeddings_file_path, embeddings)
         st.session_state['embeddings'] = embeddings
+        show_progress(f"Embeddings ready")
 
     return embeddings
 
@@ -364,6 +365,53 @@ def ask_question_and_search_old(embed_model, faiss_index, df, paragraphs, questi
     return closest_embeddings, closest_paragraphs
 
 
+def scan_around(best_abs_index, expanded_distances, expanded_para_data) -> Tuple[List[int], List[int]]:
+    """Identify optimal neighboring paragraph to include 
+    
+    by average distance to question between included paragraphs"""
+
+    do_not_change = False
+    if do_not_change:
+        use_indices = expanded_para_data['ParagraphIndex'].tolist()
+        use_distances = expanded_distances
+        use_para_data = expanded_para_data
+    else:
+        indices = expanded_para_data['ParagraphIndex'].tolist()
+        infimum = indices[0]
+        supremum = indices[-1]
+        best_distance = None
+        min_adj_distance = None
+        min_use_distances = None
+        min_abs_indices = None
+
+        # Scan over all possible covering intervals, except best line alone
+        for lower_abs_bound in range(infimum, best_abs_index + 1):
+            lower_rel_bound = lower_abs_bound - infimum
+            for upper_abs_bound in range(best_abs_index, supremum + 1):
+                upper_rel_bound = upper_abs_bound - infimum
+
+                cur_rel_indices = range(lower_rel_bound, upper_rel_bound+1)
+                cur_abs_indices = range(lower_abs_bound, upper_abs_bound+1)
+                cur_use_distances = np.array(expanded_distances)[list(cur_rel_indices)]
+                # Calculate the objective function
+                cur_adj_distance = np.average(cur_use_distances)
+
+                if len(cur_use_distances) == 1:
+                    best_distance = cur_adj_distance
+                else:
+                    if min_adj_distance is None or (cur_adj_distance < min_adj_distance):  # do not include best alone
+                        min_adj_distance = cur_adj_distance
+                        min_use_distances = cur_use_distances
+                        min_abs_indices = cur_abs_indices
+
+        if min_adj_distance < 2 * best_distance:
+            use_distances, use_para_data = min_use_distances, expanded_para_data.loc[list(min_abs_indices)]
+        else:
+            use_distances, use_para_data = [best_distance], expanded_para_data.loc[[best_abs_index]]
+
+    return use_distances, use_para_data 
+
+
 def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_data, embeddings, PRE_PARA_NUM, POST_PARA_NUM):
     """Decide which surrounding paragraphs to inludein answer
     
@@ -387,24 +435,14 @@ def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_d
     expanded_para_data = para_data.loc[selected_abs_indices]
     expanded_embeddings = embeddings[selected_abs_indices]
 
-    # expanded_indices = [
-    #     i 
-    #     for index in paper_data['ParaNo']
-    #     for i in range(max(0, index-PRE_PARA_NUM), min(len(data['paragraphs'])-1, index+POST_PARA_NUM))
-    # ]
-    # expanded_paragraphs = [data['paragraphs'][i] for i in expanded_indices]
-    # expanded_embeddings = [data['embedding'][i] for i in expanded_indices]
-
-    # reference_embedding = np.array([...])
-    # embeddings = np.array([[...], [...], ...])  # array of multiple embeddings
     question_embedding_1d = question_embedding.squeeze() # or question_embedding.reshape(-1)
-    # print(f"question_embedding.shape={question_embedding_1d.shape}")  # If using plain Python
-    # for e in expanded_embeddings:
-    #     print(f"e.shape={e.shape}")
 
     expanded_distances = [spatial.distance.cosine(question_embedding_1d, e) for e in expanded_embeddings]
 
-    return expanded_distances, expanded_para_data
+    use_distances, use_para_data = scan_around(best_abs_index, expanded_distances, expanded_para_data)
+
+    # return expanded_distances, expanded_para_data
+    return use_distances, use_para_data
 
 
 # def ask_question_and_search(embed_model, faiss_index, data, question):
