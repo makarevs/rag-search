@@ -10,12 +10,24 @@ from scipy import spatial
 import faiss
 from sentence_transformers import SentenceTransformer
 
-st.title('RAG-based Fragment Search \n(in Medium text set)') 
+# Create a sidebar
+st.sidebar.header('Settings')
+PRE_PARA_NUM = st.sidebar.slider('Number of paragraphs to prepend', min_value=0, max_value=10, value=1, step=1)
+POST_PARA_NUM = st.sidebar.slider('Number of paragraphs to append', min_value=0, max_value=10, value=2, step=1)
 
-import nltk
-nltk.download('punkt')
+MODEL_NAMES = [
+    'all-MiniLM-L6-v2', 
+    'multi-qa-MiniLM-L6-cos-v1', 
+    'paraphrase-MiniLM-L3-v2', 
+    'paraphrase-multilingual-mpnet-base-v2',
+]  # Replace these with your actual model names
+MODEL_NAME = st.sidebar.selectbox('Model Name', MODEL_NAMES)
+SHOW_DISTANCE = st.sidebar.checkbox('Show paragraph distance', value=True)
+SHOW_NUMBER = st.sidebar.checkbox('Show paragraph number', value=True)
 
-from nltk.tokenize import sent_tokenize
+# st.write(f'Selected settings: PRE_PARA_NUM={PRE_PARA_NUM}, POST_PARA_NUM={POST_PARA_NUM}, model_name={MODEL_NAME}')
+
+st.title("RAG-based Fragment Search \n(in Medium texts' dataset)") 
 
 noisy = True
 cum_percent = 0
@@ -37,13 +49,20 @@ def show_progress(message: str, percent: float = None):
         my_bar.progress(show_percent, text=message)
 
 
+import nltk
+show_progress('Downloading NLTK...')
+nltk.download('punkt')
+
+from nltk.tokenize import sent_tokenize
+
+
 # @st.cache_data(func=None, hash_funcs=None)
 def load_data(file: Union[str, Path]) -> pd.DataFrame:
     """
     Load data from a specified CSV file
     """
 
-    show_progress('Loading data...') 
+    show_progress("Loading texts' data...") 
     data = pd.read_csv(file)
     data = data.applymap(str)  # apply str() to each cell
     show_progress('Data loaded') 
@@ -231,7 +250,7 @@ def create_or_load_embeddings(data, model):
 def prepare_rag(data: pd.DataFrame):
     # Model for generating embeddings
     # https://www.sbert.net/docs/pretrained_models.html
-    model_name = 'all-MiniLM-L6-v2'
+    model_name = MODEL_NAME  # 'all-MiniLM-L6-v2'
     # model = SentenceTransformer('multi-qa-MiniLM-L6-cos-v1')
     # model = SentenceTransformer('paraphrase-MiniLM-L3-v2')
     # model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
@@ -345,13 +364,13 @@ def ask_question_and_search_old(embed_model, faiss_index, df, paragraphs, questi
     return closest_embeddings, closest_paragraphs
 
 
-def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_data, embeddings, pre_para_num, post_para_num):
+def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_data, embeddings, PRE_PARA_NUM, POST_PARA_NUM):
     """Decide which surrounding paragraphs to inludein answer
     
     Draft implementation:
-        pre_para_num, post_para_num - fixed number to include before and after, checked for article boundaries
+        PRE_PARA_NUM, POST_PARA_NUM - fixed number to include before and after, checked for article boundaries
     Refined inplementation:
-        pre_para_num, post_para_num - max number to include before and after, checked for article boundaries, and truncated by goal function
+        PRE_PARA_NUM, POST_PARA_NUM - max number to include before and after, checked for article boundaries, and truncated by goal function
     """
 
     # Get pararaph data for next best index
@@ -362,8 +381,8 @@ def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_d
     lowest_abs_index = paper_data['ParagraphIndex'].index[0]  # or paper_data['ParagraphIndex'].tolist()[0]
     highest_abs_index = paper_data['ParagraphIndex'].index[-1]  # or paper_data['ParagraphIndex'].tolist()[-1]
     selected_abs_indices = range(
-        max(lowest_abs_index, best_abs_index-pre_para_num), 
-        min(highest_abs_index, best_abs_index+post_para_num)+1
+        max(lowest_abs_index, best_abs_index-PRE_PARA_NUM), 
+        min(highest_abs_index, best_abs_index+POST_PARA_NUM)+1
     )
     expanded_para_data = para_data.loc[selected_abs_indices]
     expanded_embeddings = embeddings[selected_abs_indices]
@@ -371,7 +390,7 @@ def expand_around_relevant_paragraphs(question_embedding, best_abs_index, para_d
     # expanded_indices = [
     #     i 
     #     for index in paper_data['ParaNo']
-    #     for i in range(max(0, index-pre_para_num), min(len(data['paragraphs'])-1, index+post_para_num))
+    #     for i in range(max(0, index-PRE_PARA_NUM), min(len(data['paragraphs'])-1, index+POST_PARA_NUM))
     # ]
     # expanded_paragraphs = [data['paragraphs'][i] for i in expanded_indices]
     # expanded_embeddings = [data['embedding'][i] for i in expanded_indices]
@@ -416,14 +435,19 @@ def ask_question_and_search(embed_model, faiss_index, para_data, embeddings, que
                 best_abs_index=best_abs_index,
                 para_data=para_data, 
                 embeddings=embeddings, 
-                pre_para_num=1, 
-                post_para_num=2
+                PRE_PARA_NUM=1, 
+                POST_PARA_NUM=2
             )
             # for para_distance, para_data in zip(expanded_distances, expanded_para_data):
             for i, para_data_row in enumerate(expanded_para_data.itertuples()):
                 para_distance = expanded_distances[i]
                 para_data_row = pd.Series(data=para_data_row[1:], index=expanded_para_data.columns)
-                st.write(f":green[{round(para_distance,3)}] | :grey[{para_data_row['ParaNo']}] | :blue[{para_data_row['ParaText']}]")
+                entry = ' | '.join(
+                    ([f":green[{round(para_distance,3)}]"] if SHOW_DISTANCE else []) +
+                    ([f":grey[{para_data_row['ParaNo']}]"] if SHOW_NUMBER else []) +
+                    [f":blue[{para_data_row['ParaText']}]"]
+                )
+                st.write(entry)
 
 
 def main():
